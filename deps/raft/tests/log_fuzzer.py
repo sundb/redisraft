@@ -1,41 +1,10 @@
-from cffi import FFI
-
 import subprocess
 import unittest
 
+import raft_cffi
+
 from hypothesis import given
 from hypothesis.strategies import lists, just, integers, one_of
-
-
-class Libraft(object):
-    def __init__(self):
-        ffi = FFI()
-        ffi.set_source(
-            "ffi_tests",
-            """
-            """,
-            sources="""
-                src/raft_log.c
-                src/raft_server.c
-                src/raft_server_properties.c
-                src/raft_node.c
-                """.split(),
-            include_dirs=["include"],
-            extra_compile_args=["-UNDEBUG"]
-            )
-        library = ffi.compile()
-
-        self.ffi = ffi = FFI()
-        self.lib = ffi.dlopen(library)
-
-        def load(fname):
-            return '\n'.join(
-                [line for line in subprocess.check_output(
-                    ["gcc", "-E", fname]).decode('utf-8').split('\n')
-                 if not line.startswith('#')])
-
-        ffi.cdef(load('include/raft.h'))
-        ffi.cdef(load('include/raft_log.h'))
 
 
 commands = one_of(
@@ -71,14 +40,14 @@ class Log(object):
 class CoreTestCase(unittest.TestCase):
     def setUp(self):
         super(CoreTestCase, self).setUp()
-        self.r = Libraft()
+        self.r = raft_cffi
 
     @given(lists(commands))
     def test_sanity_check(self, commands):
         r = self.r.lib
 
         unique_id = 1
-        l = r.log_alloc(1)
+        l = r.raft_log_alloc(1)
 
         log = Log()
 
@@ -88,32 +57,31 @@ class CoreTestCase(unittest.TestCase):
                 entry.id = unique_id
                 unique_id += 1
 
-                ret = r.log_append_entry(l, entry)
+                ret = r.raft_log_append_entry(l, entry)
                 assert ret == 0
 
                 log.append(entry)
 
             elif cmd == 'poll':
-                entry_ptr = self.r.ffi.new('void**')
+                entry_ptr = self.r.ffi.new('raft_entry_t**')
 
                 if log.entries:
-                    ret = r.log_poll(l, entry_ptr)
+                    ret = r.raft_log_poll(l, entry_ptr)
                     assert ret == 0
 
                     ety_expected = log.poll()
-                    ety_actual = self.r.ffi.cast('raft_entry_t**', entry_ptr)[0]
-                    assert ety_actual.id == ety_expected.id
+                    assert entry_ptr[0].id == ety_expected.id
 
             elif isinstance(cmd, int):
                 if log.entries:
                     log.delete(cmd)
-                    ret = r.log_delete(l, cmd)
+                    ret = r.raft_log_delete(l, cmd)
                     assert ret == 0
 
             else:
                 assert False
 
-            self.assertEqual(r.log_count(l), log.count())
+            self.assertEqual(r.raft_log_count(l), log.count())
 
 
 if __name__ == '__main__':

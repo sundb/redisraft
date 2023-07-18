@@ -3,7 +3,7 @@
 This is a Terraform script to launch a Jepsen test environment on AWS.
 It launches and configures 5 cluster test nodes and one control node.
 
-All nodes run Debian stretch.
+All nodes run Debian.
 
 ## Getting started
 
@@ -22,7 +22,7 @@ Once launched, connect to the control node:
 Clone the Jepsen Redis test. You may need the auto generated SSH key file
 authorized to do that in GitHub.
 
-    git clone https://github.com/jepsen-io/redis jepsen
+    git clone https://github.com/redislabs/jepsen-redisraft jepsen
     cd jepsen
     lein install
 
@@ -37,6 +37,6 @@ To run a test:
         --test-count 50 \
         --concurrency 4n \
         --redis-repo https://github.com/redis/redis \
-        --redis-version 6.2.3 \
+        --redis-version unstable \
         --raft-repo https://github.com/redislabs/redisraft \
-        --raft-version cf235c1
+        --raft-version master

@@ -11,20 +11,11 @@
 #include "raft_private.h"
 #include "mock_send_functions.h"
 
-static int __raft_persist_term(
-    raft_server_t* raft,
+static int __raft_persist_metadata(
+    raft_server_t *raft,
     void *udata,
     raft_term_t term,
-    int vote
-    )
-{
-    return 0;
-}
-
-static int __raft_persist_vote(
-    raft_server_t* raft,
-    void *udata,
-    int vote
+    raft_node_id_t vote
     )
 {
     return 0;
@@ -45,7 +36,7 @@ void TestRaft_scenario_leader_appears(CuTest * tc)
     {
         r[j] = raft_new();
         sender_set_raft(sender[j], r[j]);
-        raft_set_election_timeout(r[j], 500);
+        raft_config(r[j], 1, RAFT_CONFIG_ELECTION_TIMEOUT, 500);
         raft_add_node(r[j], sender[0], 1, j==0);
         raft_add_node(r[j], sender[1], 2, j==1);
         raft_add_node(r[j], sender[2], 3, j==2);
@@ -53,14 +44,13 @@ void TestRaft_scenario_leader_appears(CuTest * tc)
                            &((raft_cbs_t) {
                                  .send_requestvote = sender_requestvote,
                                  .send_appendentries = sender_appendentries,
-                                 .persist_term = __raft_persist_term,
-                                 .persist_vote = __raft_persist_vote,
+                                 .persist_metadata = __raft_persist_metadata,
                                  .log = NULL
                              }), sender[j]);
     }
 
     /* NOTE: important for 1st node to send vote request before others */
-    raft_periodic(r[0], 1000);
+    raft_periodic_internal(r[0], 1000);
 
     for (i = 0; i < 20; i++)
     {
@@ -74,7 +64,7 @@ one_more_time:
                 goto one_more_time;
 
         for (j = 0; j < 3; j++)
-            raft_periodic(r[j], 100);
+            raft_periodic_internal(r[j], 100);
     }
 
     int leaders = 0;

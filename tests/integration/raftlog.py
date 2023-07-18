@@ -1,9 +1,7 @@
 """
-This file is part of RedisRaft.
-
-Copyright (c) 2020-2021 Redis Ltd.
-
-RedisRaft is licensed under the Redis Source Available License (RSAL).
+Copyright Redis Ltd. 2020 - present
+Licensed under your choice of the Redis Source Available License 2.0 (RSALv2)
+or the Server Side Public License v1 (SSPLv1).
 """
 
 import sys
@@ -18,8 +16,9 @@ class RawEntry(object):
     RAFTLOG = 'RAFTLOG'
     ENTRY = 'ENTRY'
 
-    def __init__(self, args):
+    def __init__(self, args, locations):
         self.args = args.copy()
+        self.locations = locations.copy()
 
     def kind(self):
         return str(self.args[0], encoding='ascii')
@@ -34,11 +33,14 @@ class RawEntry(object):
         elements = int(mb_line[1:])
 
         args = []
+        locations = []
+
         for _ in range(elements):
             hdr = str(_file.readline().rstrip(), encoding='ascii')
             if not hdr.startswith('$'):
                 raise RuntimeError('Missing/invalid bulk header')
             _len = int(hdr[1:])
+            locations.append(_file.tell())
             data = _file.read(_len)
             args.append(data)
 
@@ -47,10 +49,10 @@ class RawEntry(object):
                 raise RuntimeError('Missing CRLF after bulk data')
 
         if str(args[0], encoding='ascii') == cls.ENTRY:
-            return LogEntry(args)
+            return LogEntry(args, locations)
         if str(args[0], encoding='ascii') == cls.RAFTLOG:
-            return LogHeader(args)
-        return RawEntry(args)
+            return LogHeader(args, locations)
+        return RawEntry(args, locations)
 
     def __str__(self):
         return '<RawEntry:kind=%s>' % self.kind()
@@ -67,6 +69,9 @@ class LogHeader(RawEntry):
     def dbid(self):
         return self.args[2]
 
+    def dbid_location(self):
+        return int(self.locations[2])
+
     def node_id(self):
         return self.args[3]
 
@@ -76,28 +81,25 @@ class LogHeader(RawEntry):
     def snapshot_index(self):
         return int(self.args[5])
 
-    def last_term(self):
+    def crc(self):
         return int(self.args[6])
 
-    def last_vote(self):
-        return int(self.args[7])
+    def crc_location(self):
+        return int(self.locations[6])
 
     def __repr__(self):
         return '<LogHeader:version=%s,dbid=%s,node_id=%s,' \
-               'snapshot=<term:%s,index:%s>,last_term=%s,last_vote=%s' % (
+               'snapshot=<term:%s,index:%s>' % (
                    self.version(), self.dbid(), self.node_id(),
-                   self.snapshot_term(), self.snapshot_index(),
-                   self.last_term(), self.last_vote())
+                   self.snapshot_term(), self.snapshot_index())
 
     def __str__(self):
         return '#### node_id={} dbid={} version={}\n' \
-        '        #### last_term={} last_vote={}\n' \
-        '        #### snapshot-term={} snapshot-index={}'.format(
-            self.node_id().decode(encoding='ascii'),
-            self.dbid().decode(encoding='ascii'),
-            self.version(),
-            self.last_term(), self.last_vote(),
-            self.snapshot_term(), self.snapshot_index())
+               '#### snapshot-term={} snapshot-index={}'.format(
+                self.node_id().decode(encoding='ascii'),
+                self.dbid().decode(encoding='ascii'),
+                self.version(),
+                self.snapshot_term(), self.snapshot_index())
 
 
 class LogEntry(RawEntry):
@@ -115,8 +117,11 @@ class LogEntry(RawEntry):
     def id(self):
         return int(self.args[2])
 
+    def session(self):
+        return int(self.args[3])
+
     def type(self):
-        return self.LogType(int(self.args[3]))
+        return self.LogType(int(self.args[4]))
 
     def type_is_cfgchange(self):
         _type = self.type()
@@ -137,7 +142,7 @@ class LogEntry(RawEntry):
         return '<ShardGroup:slots=%s-%s,nodes=%s>' % (
             hdr[0], hdr[1],
             ','.join(['<id={},addr={}:{}'.format(*e.split(':'))
-                 for e in data_lines[1:] if len(e) > 0]))
+                      for e in data_lines[1:] if len(e) > 0]))
 
     @staticmethod
     def parse_cmdlist(data):
@@ -146,13 +151,13 @@ class LogEntry(RawEntry):
         i = 1
         for _ in range(cmd_count):
             args_count = int(data[i][1:])
-            i_end = i + 1 + (args_count)*2
+            i_end = i + 1 + args_count*2
             cmds.append(' '.join(data[i+2:i_end:2]))
             i = i_end
         return '|'.join(cmds)
 
     def data(self, decode=False):
-        value = self.args[4]
+        value = self.args[5]
         if self.type_is_cfgchange():
             return self.parse_cfgchange(value)
         elif self.type() == self.LogType.ADD_SHARDGROUP:
@@ -166,34 +171,48 @@ class LogEntry(RawEntry):
             else:
                 return value
 
+    def data_location(self):
+        return int(self.locations[4])
+
+    def crc(self):
+        return int(self.args[5])
+
+    def crc_location(self):
+        return int(self.locations[5])
+
     def __repr__(self):
-        return '<LogEntry:%s:id=%s,term=%s,data=%s>' % (
-            self.type(), self.id(), self.term(), self.data())
+        return '<LogEntry:%s:id=%s,term=%s,session=%s,data=%s>' % (
+            self.type(), self.id(), self.term(), self.session(), self.data())
 
     def __str__(self):
-        return '{:4d} {:10d} {} {}'.format(
-            self.term(), self.id(), self.type().name, self.data(decode=True))
+        return '{:4d} {:10d} {} {} {}'.format(
+            self.term(), self.id(), self.session(), self.type().name,
+            self.data(decode=True))
 
 
 class RaftLog(object):
     def __init__(self, filename):
         self.logfile = open(filename, 'rb')
         self.entries = []
+        self.indexes = []
 
     def reset(self):
         self.entries = []
+        self.indexes = []
         self.logfile.seek(0, os.SEEK_SET)
 
     def read(self):
         while True:
+            offset = self.logfile.tell()
             try:
                 entry = RawEntry.from_file(self.logfile)
             except EOFError:
                 break
             self.entries.append(entry)
+            self.indexes.append(offset)
         self.dump()
 
-    def header(self):
+    def header(self) -> LogHeader:
         return self.entries[0]
 
     def last_entry(self):
@@ -215,10 +234,14 @@ class RaftLog(object):
         logging.info('===== End Raft Log Dump =====')
 
 
-if __name__ == '__main__':
+def main():
     log = RaftLog(sys.argv[1])
     log.read()
     i = 0
     for entry in log.entries:
         print('{:7d} {}'.format(i, str(entry)))
         i += 1
+
+
+if __name__ == '__main__':
+    main()

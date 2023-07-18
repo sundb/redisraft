@@ -22,6 +22,7 @@ Usage:
   virtraft --servers SERVERS [-d RATE] [-D RATE] [-c RATE] [-C RATE] [-m RATE]
                              [-P RATE] [-s SEED] [-i ITERS] [-p] [--tsv] [--rqm MULTI]
                              [-q] [-v] [-l LEVEL] [-j] [-L LOGFILE] [--duplex_partition]
+                             [--auto_flush]
   virtraft --version
   virtraft --help
 
@@ -49,6 +50,7 @@ Options:
   -V --version               Display version.
   -h --help                  Prints a short usage summary.
   --duplex_partition         On partition, prevent traffic from flowing in both directions
+  --auto_flush               Use libraft with auto_flush option
 
 Examples:
 
@@ -131,6 +133,9 @@ def err2str(err):
         lib.RAFT_INVALID_NODEID: 'RAFT_INVALID_NODEID',
         lib.RAFT_ERR_LEADER_TRANSFER_IN_PROGRESS: 'RAFT_ERR_LEADER_TRANSFER_IN_PROGRESS',
         lib.RAFT_ERR_DONE: 'RAFT_ERR_DONE',
+        lib.RAFT_ERR_NOT_FOUND: 'RAFT_ERR_NOT_FOUND',
+        lib.RAFT_ERR_MISUSE: 'RAFT_ERR_MISUSE',
+        lib.RAFT_ERR_TRYAGAIN: 'RAFT_ERR_TRYAGAIN',
         lib.RAFT_ERR_LAST: 'RAFT_ERR_LAST',
     }[err]
 
@@ -187,8 +192,8 @@ def raft_send_snapshot(raft, udata, node, msg):
     return 0
 
 
-def raft_load_snapshot(raft, udata, index, term):
-    return ffi.from_handle(udata).load_snapshot(index, term)
+def raft_load_snapshot(raft, udata, term, index):
+    return ffi.from_handle(udata).load_snapshot(term, index)
 
 
 def raft_clear_snapshot(raft, udata):
@@ -231,12 +236,8 @@ def raft_applylog(raft, udata, ety, idx):
         return lib.RAFT_ERR_SHUTDOWN
 
 
-def raft_persist_vote(raft, udata, voted_for):
-    return ffi.from_handle(udata).persist_vote(voted_for)
-
-
-def raft_persist_term(raft, udata, term, vote):
-    return ffi.from_handle(udata).persist_term(term, vote)
+def raft_persist_metadata(raft, udata, term, vote):
+    return ffi.from_handle(udata).persist_metadata(term, vote)
 
 
 def raft_logentry_offer(raft, udata, ety, ety_idx):
@@ -311,6 +312,9 @@ def verify_read(arg):
             continue
 
         node = lib.raft_get_node(net.servers[i-1].raft, leader.id)
+        if node == ffi.NULL:
+            continue
+
         msg_id = lib.raft_node_get_max_seen_msg_id(node)
         if msg_id >= arg:
             count += 1
@@ -330,13 +334,12 @@ def handle_read_queue(arg, can_read):
         logger.debug(f"ignoring read_request {val}")
 
 
-def raft_log(raft, node, udata, buf):
+def raft_log(raft, udata, buf):
     server = ffi.from_handle(lib.raft_get_udata(raft))
     # if server.id in [1] or (node and node.id in [1]):
-    logger.info('{0}>  {1}:{2}: {3}'.format(
+    logger.info('{0}>  {1}: {2}'.format(
         server.network.iteration,
         server.id,
-        node,
         ffi.string(buf).decode('utf8'),
     ))
 
@@ -363,6 +366,7 @@ class Network(object):
         self.partitions = set()
         self.no_random_period = False
         self.duplex_partition = False
+        self.auto_flush = False
         self.last_seen_read_queue_msg_id = -1
         self.rqm = 10000000000
 
@@ -407,7 +411,7 @@ class Network(object):
             if lib.raft_is_leader(sv.raft):
                 msg_id = lib.raft_get_msg_id(sv.raft) + 1
                 arg = sv.id * net.rqm + msg_id
-                lib.raft_queue_read_request(sv.raft, sv.handle_read_queue, ffi.cast("void *", arg))
+                lib.raft_recv_read_request(sv.raft, sv.handle_read_queue, ffi.cast("void *", arg))
 
     def id2server(self, id):
         for server in self.servers:
@@ -457,6 +461,12 @@ class Network(object):
                 server.periodic(100)
             else:
                 server.periodic(self.random.randint(1, 100))
+
+            if not self.auto_flush:
+                # Pretend like async disk write operation is completed. Also,
+                # call raft_flush() often to trigger sending appendentries.
+                idx = lib.raft_get_index_to_sync(server.raft)
+                assert lib.raft_flush(server.raft, idx) == 0
 
         # Deadlock detection
         if self.client_rate != 0 and self.latest_applied_log_idx != 0 and self.latest_applied_log_iteration + 5000 < self.iteration:
@@ -518,7 +528,7 @@ class Network(object):
         new_msg = ffi.cast(ffi.typeof(msg), lib.malloc(msg_size))
         ffi.memmove(new_msg, msg, msg_size)
 
-        if msg_type == 'msg_appendentries_t *':
+        if msg_type == 'raft_appendentries_req_t *':
             new_msg.entries = lib.raft_entry_array_deepcopy(msg.entries, msg.n_entries)
 
         self.messages.append(Message(new_msg, sendor, sendee))
@@ -528,9 +538,9 @@ class Network(object):
 
         logger.debug(f"poll_message: {msg.sendor.id} -> {msg.sendee.id} ({msg_type}")
 
-        if msg_type == 'msg_appendentries_t *':
+        if msg_type == 'raft_appendentries_req_t *':
             node = lib.raft_get_node(msg.sendee.raft, msg.sendor.id)
-            response = ffi.new('msg_appendentries_response_t*')
+            response = ffi.new('raft_appendentries_resp_t*')
             e = lib.raft_recv_appendentries(msg.sendee.raft, node, msg.data, response)
             if lib.RAFT_ERR_SHUTDOWN == e:
                 logger.error('Catastrophic')
@@ -541,27 +551,27 @@ class Network(object):
             else:
                 self.enqueue_msg(response, msg.sendee, msg.sendor)
 
-        elif msg_type == 'msg_appendentries_response_t *':
+        elif msg_type == 'raft_appendentries_resp_t *':
             node = lib.raft_get_node(msg.sendee.raft, msg.sendor.id)
             lib.raft_recv_appendentries_response(msg.sendee.raft, node, msg.data)
 
-        elif msg_type == 'msg_snapshot_t *':
-            response = ffi.new('msg_snapshot_response_t *')
+        elif msg_type == 'raft_snapshot_req_t *':
+            response = ffi.new('raft_snapshot_resp_t *')
             node = lib.raft_get_node(msg.sendee.raft, msg.sendor.id)
             lib.raft_recv_snapshot(msg.sendee.raft, node, msg.data, response)
             self.enqueue_msg(response, msg.sendee, msg.sendor)
 
-        elif msg_type == 'msg_snapshot_response_t *':
+        elif msg_type == 'raft_snapshot_resp_t *':
             node = lib.raft_get_node(msg.sendee.raft, msg.sendor.id)
             lib.raft_recv_snapshot_response(msg.sendee.raft, node, msg.data)
 
-        elif msg_type == 'msg_requestvote_t *':
-            response = ffi.new('msg_requestvote_response_t*')
+        elif msg_type == 'raft_requestvote_req_t *':
+            response = ffi.new('raft_requestvote_resp_t*')
             node = lib.raft_get_node(msg.sendee.raft, msg.sendor.id)
             lib.raft_recv_requestvote(msg.sendee.raft, node, msg.data, response)
             self.enqueue_msg(response, msg.sendee, msg.sendor)
 
-        elif msg_type == 'msg_requestvote_response_t *':
+        elif msg_type == 'raft_requestvote_resp_t *':
             node = lib.raft_get_node(msg.sendee.raft, msg.sendor.id)
             e = lib.raft_recv_requestvote_response(msg.sendee.raft, node, msg.data)
             if lib.RAFT_ERR_SHUTDOWN == e:
@@ -654,7 +664,7 @@ class Network(object):
         e = server.recv_entry(ety)
         assert e == 0
 
-        lib.raft_set_commit_idx(server.raft, 1)
+        lib.raft_set_commit_idx(server.raft, 2)
         e = lib.raft_apply_all(server.raft)
         assert e == 0
 
@@ -767,7 +777,6 @@ class Network(object):
         logger.info(f"trying to remove follower: node {lib.raft_get_nodeid(server.raft)}")
 
         # Wake up new node
-        assert NODE_CONNECTED == server.connection_status
         server.set_connection_status(NODE_DISCONNECTING)
 
     def diagnostic_info(self):
@@ -823,8 +832,7 @@ class RaftServer(object):
         cbs.get_snapshot_chunk = self.raft_get_snapshot_chunk
         cbs.store_snapshot_chunk = self.raft_store_snapshot_chunk
         cbs.applylog = self.raft_applylog
-        cbs.persist_vote = self.raft_persist_vote
-        cbs.persist_term = self.raft_persist_term
+        cbs.persist_metadata = self.raft_persist_metadata
         cbs.get_node_id = self.raft_get_node_id
         cbs.node_has_sufficient_logs = self.raft_node_has_sufficient_logs
         cbs.notify_membership_event = self.raft_notify_membership_event
@@ -836,8 +844,14 @@ class RaftServer(object):
         log_cbs.log_pop = self.raft_logentry_pop
 
         lib.raft_set_callbacks(self.raft, cbs, self.udata)
-        lib.log_set_callbacks(lib.raft_get_log(self.raft), log_cbs, self.raft)
-        lib.raft_set_election_timeout(self.raft, 500)
+        lib.raft_log_set_callbacks(lib.raft_get_log(self.raft), log_cbs, self.raft)
+
+        lib.raft_config(self.raft, 1, lib.RAFT_CONFIG_ELECTION_TIMEOUT,
+                        ffi.cast("int", 500))
+        lib.raft_config(self.raft, 1, lib.RAFT_CONFIG_LOG_ENABLED,
+                        ffi.cast("int", 1))
+        lib.raft_config(self.raft, 1, lib.RAFT_CONFIG_AUTO_FLUSH,
+                        ffi.cast("int", network.auto_flush))
 
         self.fsm_dict = {}
         self.fsm_log = []
@@ -878,7 +892,7 @@ class RaftServer(object):
         # logger.warning('{} snapshotting'.format(self))
         # entries_before = lib.raft_get_log_count(self.raft)
 
-        e = lib.raft_begin_snapshot(self.raft, 0)
+        e = lib.raft_begin_snapshot(self.raft)
         if e != 0:
             return
 
@@ -905,10 +919,10 @@ class RaftServer(object):
         #     ))
 
     def periodic(self, msec):
-        if self.network.random.randint(1, 100000) < self.network.compaction_rate:
+        if self.network.random.randint(1, 100) < self.network.compaction_rate:
             self.do_compaction()
 
-        e = lib.raft_periodic(self.raft, msec)
+        e = lib.raft_periodic_internal(self.raft, msec)
         if lib.RAFT_ERR_SHUTDOWN == e:
             self.shutdown()
 
@@ -929,28 +943,27 @@ class RaftServer(object):
         self.network = network
 
     def load_callbacks(self):
-        self.raft_send_requestvote = ffi.callback("int(raft_server_t*, void*, raft_node_t*, msg_requestvote_t*)", raft_send_requestvote)
-        self.raft_send_appendentries = ffi.callback("int(raft_server_t*, void*, raft_node_t*, msg_appendentries_t*)", raft_send_appendentries)
-        self.raft_send_snapshot = ffi.callback("int(raft_server_t*, void* , raft_node_t*, msg_snapshot_t*)", raft_send_snapshot)
-        self.raft_load_snapshot = ffi.callback("int(raft_server_t*, void*, raft_index_t, raft_term_t)", raft_load_snapshot)
+        self.raft_send_requestvote = ffi.callback("int(raft_server_t*, void*, raft_node_t*, raft_requestvote_req_t*)", raft_send_requestvote)
+        self.raft_send_appendentries = ffi.callback("int(raft_server_t*, void*, raft_node_t*, raft_appendentries_req_t*)", raft_send_appendentries)
+        self.raft_send_snapshot = ffi.callback("int(raft_server_t*, void* , raft_node_t*, raft_snapshot_req_t*)", raft_send_snapshot)
+        self.raft_load_snapshot = ffi.callback("int(raft_server_t*, void*, raft_term_t, raft_index_t)", raft_load_snapshot)
         self.raft_clear_snapshot = ffi.callback("int(raft_server_t*, void*)", raft_clear_snapshot)
         self.raft_get_snapshot_chunk = ffi.callback("int(raft_server_t*, void*, raft_node_t*, raft_size_t offset, raft_snapshot_chunk_t*)", raft_get_snapshot_chunk)
         self.raft_store_snapshot_chunk = ffi.callback("int(raft_server_t*, void*, raft_index_t index, raft_size_t offset, raft_snapshot_chunk_t*)", raft_store_snapshot_chunk)
         self.raft_applylog = ffi.callback("int(raft_server_t*, void*, raft_entry_t*, raft_index_t)", raft_applylog)
-        self.raft_persist_vote = ffi.callback("int(raft_server_t*, void*, raft_node_id_t)", raft_persist_vote)
-        self.raft_persist_term = ffi.callback("int(raft_server_t*, void*, raft_term_t, raft_node_id_t)", raft_persist_term)
+        self.raft_persist_metadata = ffi.callback("int(raft_server_t*, void*, raft_term_t, raft_node_id_t)", raft_persist_metadata)
         self.raft_logentry_offer = ffi.callback("int(raft_server_t*, void*, raft_entry_t*, raft_index_t)", raft_logentry_offer)
         self.raft_logentry_poll = ffi.callback("int(raft_server_t*, void*, raft_entry_t*, raft_index_t)", raft_logentry_poll)
         self.raft_logentry_pop = ffi.callback("int(raft_server_t*, void*, raft_entry_t*, raft_index_t)", raft_logentry_pop)
         self.raft_get_node_id = ffi.callback("int(raft_server_t*, void*, raft_entry_t*, raft_index_t)", raft_get_node_id)
         self.raft_node_has_sufficient_logs = ffi.callback("int(raft_server_t* raft, void *user_data, raft_node_t* node)", raft_node_has_sufficient_logs)
         self.raft_notify_membership_event = ffi.callback("void(raft_server_t* raft, void *user_data, raft_node_t* node, raft_entry_t* ety, raft_membership_e)", raft_notify_membership_event)
-        self.raft_log = ffi.callback("void(raft_server_t*, raft_node_id_t, void*, const char* buf)", raft_log)
+        self.raft_log = ffi.callback("void(raft_server_t*, void*, const char* buf)", raft_log)
         self.handle_read_queue = ffi.callback("void(void *arg, int can_read)", handle_read_queue)
 
     def recv_entry(self, ety):
         # FIXME: leak
-        response = ffi.new('msg_entry_response_t*')
+        response = ffi.new('raft_entry_resp_t*')
         return lib.raft_recv_entry(self.raft, ety, response)
 
     def get_entry(self, idx):
@@ -1070,10 +1083,20 @@ class RaftServer(object):
 
         return 0
 
-    def load_snapshot(self, index, term):
+    def load_snapshot(self, term, index):
         logger.debug('{} loading snapshot'.format(self))
 
         leader = find_leader()
+        if not leader:
+            return 0
+
+        # In case leader has a more recent snapshot, skip loading. Later in this
+        # function, we use leader's configuration to reconfigure nodes from the
+        # snapshot. If leader has taken another snapshot, we cannot use that
+        # configuration for the current snapshot load operation.
+        if leader.snapshot.last_idx != index:
+            return -1
+
         leader_snapshot = leader.snapshot_buf
 
         # Copy received snapshot as our snapshot and clear the temp buf
@@ -1148,11 +1171,7 @@ class RaftServer(object):
         #     self, snapshot.last_term, snapshot.last_idx))
         return 0
 
-    def persist_vote(self, voted_for):
-        # TODO: add disk simulation
-        return 0
-
-    def persist_term(self, term, vote):
+    def persist_metadata(self, term, vote):
         # TODO: add disk simulation
         return 0
 
@@ -1162,30 +1181,37 @@ class RaftServer(object):
         This is a virtraft specific check to make sure entry passing is
         working correctly.
         """
+        def get_last_user_entry(idx):
+            while True:
+                if idx == lib.raft_get_snapshot_last_idx(self.raft):
+                    return None
+
+                prev_ety = lib.raft_get_entry_from_idx(self.raft, idx)
+                assert prev_ety
+
+                if prev_ety.type == lib.RAFT_LOGTYPE_NO_OP:
+                    lib.raft_entry_release(prev_ety)
+                    idx = idx - 1
+                    continue
+
+                return prev_ety
+
         if ety.type == lib.RAFT_LOGTYPE_NO_OP:
             return
 
-        ci = lib.raft_get_current_idx(self.raft)
-        if 0 < ci and not lib.raft_get_snapshot_last_idx(self.raft) == ci:
-            other_id = None
-            try:
-                prev_ety = lib.raft_get_entry_from_idx(self.raft, ci)
-                assert prev_ety
-                if prev_ety.type == lib.RAFT_LOGTYPE_NO_OP:
-                    if lib.raft_get_snapshot_last_idx(self.raft) != ci - 1:
-                        lib.raft_entry_release(prev_ety)
-                        prev_ety = lib.raft_get_entry_from_idx(self.raft, ci - 1)
-                        assert prev_ety
-                    else:
-                        lib.raft_entry_release(prev_ety)
-                        return
-                other_id = prev_ety.id
-                assert other_id < ety.id
-                lib.raft_entry_release(prev_ety)
-            except Exception as e:
-                logger.error(other_id, ety.id)
-                self.abort_exception = e
-                raise
+        last_ety = None
+
+        try:
+            ci = lib.raft_get_current_idx(self.raft)
+            last_ety = get_last_user_entry(ci)
+            if not last_ety:
+                return
+
+            assert ety.id > last_ety.id
+        except Exception as e:
+            logger.error("ids", last_ety.id, ety.id)
+            self.abort_exception = e
+            raise
 
     def entry_append(self, ety, ety_idx):
         try:
@@ -1353,6 +1379,7 @@ if __name__ == '__main__':
     net.no_random_period = 1 == int(args['--no_random_period'])
     net.duplex_partition = 1 == int(args['--duplex_partition'])
     net.rqm = int(args['--rqm'])
+    net.auto_flush = 1 == int(args['--auto_flush'])
 
     net.num_of_servers = int(args['--servers'])
 

@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Copyright Redis Ltd. 2020 - present
+# Licensed under your choice of the Redis Source Available License 2.0 (RSALv2) or
+# the Server Side Public License v1 (SSPLv1).
+
 # Settings
 REDIS_SERVER_BINARY=${REDIS_SERVER_BINARY:-${PWD}/../../../redis/src/redis-server}
 REDIS_CLI_BINARY=${REDIS_CLI_BINARY:-${PWD}/../../../redis/src/redis-cli}
@@ -31,9 +35,9 @@ start_instance() {
         --dbfilename dump-${port}.rdb \
         --daemonize yes \
         --loadmodule ${REDISRAFT} \
-            raft-log-filename raftlog-${port}.db \
-            addr ${HOST}:${port} \
-            sharding ${SHARDING} \
+        --raft.log-filename raftlog-${port}.db \
+        --raft.addr ${HOST}:${port} \
+        --raft.sharding ${SHARDING} \
         ${ADDITIONAL_OPTIONS}
 }
 
@@ -90,8 +94,8 @@ then
     PORT=$((PORT+INSTANCE))
     while [ 1 ]; do
         clear
-        echo "`date` | $HOST:$PORT | RAFT.INFO"
-        ${REDIS_CLI_BINARY} -p $PORT --raw raft.info
+        echo "`date` | $HOST:$PORT | INFO raft"
+        ${REDIS_CLI_BINARY} -p $PORT info raft
         sleep 1
     done
     exit 0
@@ -164,12 +168,12 @@ echo "Usage: $0 [start|create|stop|watch|tail|clean|call|call-instance|stop-inst
 echo "start                     -- Launch RedisRaft Redis instances."
 echo "create                    -- Create a RedisRaft cluster."
 echo "stop                      -- Stop RedisRaft instances."
-echo "watch <id>                -- Show RAFT.INFO output first (default) or specified instance."
+echo "watch <id>                -- Show 'INFO raft' output first (default) or specified instance."
 echo "tail <id>                 -- Run tail -f of instance at base port + ID."
 echo "tailall                   -- Run tail -f for all the log files at once."
 echo "clean                     -- Remove all instances data, logs, configs."
 echo "clean-logs                -- Remove just instances logs."
 echo "call <cmd>                -- Call a command on all instances."
 echo "call-instance <id> <cmd>  -- Call a command on a specific instance."
-echo "start-instance <id>   -- Start a RedisRaft instance that has been stopped."
-echo "stop-instance <id>    -- Stop a RedisRaft instance."
+echo "start-instance <id>       -- Start a RedisRaft instance that has been stopped."
+echo "stop-instance <id>        -- Stop a RedisRaft instance."

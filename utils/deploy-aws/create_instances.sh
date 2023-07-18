@@ -1,8 +1,13 @@
 #!/bin/bash
 
+# Copyright Redis Ltd. 2020 - present
+# Licensed under your choice of the Redis Source Available License 2.0 (RSALv2) or
+# the Server Side Public License v1 (SSPLv1).
+
 SHARDS=9
 NODES=3
 BASE_PORT=5000
+OUTFILE=ansible/instances.yml
 
 abort() {
     echo "Error: $*"
@@ -43,6 +48,11 @@ while [ $# -gt 0 ]; do
             [ $# -gt 0 ] || abort "Missing --base-port argument"
             BASE_PORT=$1
             ;;
+        --outfile)
+            shift
+            [ $# -gt 0 ] || abort "Missing --outfile argument"
+            OUTFILE="$1"
+            ;;
         *)
             abort "Unknown argument $1"
             ;;
@@ -55,4 +65,4 @@ echo "Nodes: $NODES"
 echo "Shards: $SHARDS"
 echo "Base Port: $BASE_PORT"
 
-gen_instances > instances.yml
+gen_instances > $OUTFILE

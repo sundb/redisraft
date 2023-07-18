@@ -1,3 +1,9 @@
+"""
+Copyright Redis Ltd. 2020 - present
+Licensed under your choice of the Redis Source Available License 2.0 (RSALv2)
+or the Server Side Public License v1 (SSPLv1).
+"""
+
 import threading
 from redis import RedisError
 
@@ -34,13 +40,13 @@ class MonotonicIncrCheck(AbstractWork):
         self.counter_key = 'counter-%s' % self.thread_id
         self.val = 0
 
-    def do_work(self, iteration):
+    def do_work(self, _iteration):
         try:
             new_val = self.client.incr(self.counter_key)
             if new_val <= self.val:
                 return False
             self.val = new_val
-        except RedisError as err:
+        except RedisError:
             pass
         return True
 

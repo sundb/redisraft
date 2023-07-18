@@ -1,10 +1,14 @@
 #!/bin/bash
 
+# Copyright Redis Ltd. 2020 - present
+# Licensed under your choice of the Redis Source Available License 2.0 (RSALv2) or
+# the Server Side Public License v1 (SSPLv1).
+
 REDIS_DIR=${REDIS_DIR:-${PWD}/../redis}
 
 export REDIS_SERVER_BINARY=${REDIS_DIR}/src/redis-server
 export REDIS_CLI_BINARY=${REDIS_DIR}/src/redis-cli
-export ADDITIONAL_OPTIONS="raft-log-fsync no"
+export ADDITIONAL_OPTIONS="--raft.log-fsync no"
 
 setup() {
     pushd ./utils/create-cluster
@@ -27,7 +31,6 @@ run_tests() {
     ./runtest \
         --host 127.0.0.1 \
         --port 5001 \
-        --cluster-mode \
         --singledb \
         --ignore-encoding \
         --ignore-digest \

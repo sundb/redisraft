@@ -1,28 +1,14 @@
 """
-This file is part of RedisRaft.
-
-Copyright (c) 2020-2021 Redis Ltd.
-
-RedisRaft is licensed under the Redis Source Available License (RSAL).
+Copyright Redis Ltd. 2020 - present
+Licensed under your choice of the Redis Source Available License 2.0 (RSALv2)
+or the Server Side Public License v1 (SSPLv1).
 """
 
-import time
-from pytest import raises, skip
+from pytest import raises
 from redis.exceptions import ExecAbortError, ResponseError
 
-class RawConnection(object):
-    """
-    Implement a simply way of executing a Redis command and return the raw
-    unprocessed reply (unlike redis-py's execute_command() which applies some
-    command-specific parsing.
-    """
+from .sandbox import RawConnection
 
-    def __init__(self, client):
-        self._conn = client.connection_pool.get_connection('raw-connection')
-
-    def execute(self, *cmd):
-        self._conn.send_command(*cmd)
-        return self._conn.read_response()
 
 def test_multi_exec_invalid_use(cluster):
     r1 = cluster.add_node()
@@ -65,7 +51,7 @@ def test_multi_exec(cluster):
 
     # MULTI does not go itself to the log
     assert conn.execute('MULTI') == b'OK'
-    assert r1.raft_info()['current_index'] == 1
+    assert r1.info()['raft_current_index'] == 2
 
     # MULTI cannot be nested
     with raises(ResponseError, match='.*MULTI calls can not be nested'):
@@ -77,36 +63,11 @@ def test_multi_exec(cluster):
     assert conn.execute('INCR', 'key') == b'QUEUED'
 
     # More validations
-    assert r1.raft_info()['current_index'] == 1
+    assert r1.info()['raft_current_index'] == 2
     assert conn.execute('EXEC') == [1, 2, 3]
-    assert r1.raft_info()['current_index'] == 2
+    assert r1.info()['raft_current_index'] == 3
 
     assert conn.execute('GET', 'key') == b'3'
-
-
-def test_multi_exec_state_cleanup(cluster):
-    """
-    MULTI/EXEC state is cleaned up on client disconnect
-    """
-
-    r1 = cluster.add_node()
-
-    # Normal flow, no disconnect
-    c1 = r1.client.connection_pool.get_connection('multi')
-    c1.send_command('MULTI')
-    assert c1.read_response() == b'OK'
-
-    c2 = r1.client.connection_pool.get_connection('multi')
-    c2.send_command('MULTI')
-    assert c2.read_response() == b'OK'
-
-    assert r1.raft_info()['clients_in_multi_state'] == 2
-
-    c1.disconnect()
-    c2.disconnect()
-
-    time.sleep(1)   # Not ideal
-    assert r1.raft_info()['clients_in_multi_state'] == 0
 
 
 def test_multi_exec_proxying(cluster):
@@ -116,11 +77,11 @@ def test_multi_exec_proxying(cluster):
     cluster.create(3)
     assert cluster.leader == 1
     assert cluster.node(2).client.execute_command(
-        'RAFT.CONFIG', 'SET', 'follower-proxy', 'yes') == b'OK'
+        'CONFIG', 'SET', 'raft.follower-proxy', 'yes') == b'OK'
 
     # Basic sanity
     n2 = cluster.node(2)
-    assert n2.raft_info()['current_index'] == 5
+    assert n2.info()['raft_current_index'] == 6
     conn = RawConnection(n2.client)
 
     assert conn.execute('MULTI') == b'OK'
@@ -128,45 +89,7 @@ def test_multi_exec_proxying(cluster):
     assert conn.execute('INCR', 'key') == b'QUEUED'
     assert conn.execute('INCR', 'key') == b'QUEUED'
     assert conn.execute('EXEC') == [1, 2, 3]
-    assert n2.raft_info()['current_index'] == 6
-
-
-def test_multi_exec_with_disconnect(cluster):
-    """
-    MULTI/EXEC, client drops before EXEC.
-    """
-
-    r1 = cluster.add_node()
-
-    c1 = r1.client.connection_pool.get_connection('c1')
-    c2 = r1.client.connection_pool.get_connection('c2')
-
-    # We use RAFT.DEBUG COMPACT with delay to make the Raft thread
-    # busy and allow us to queue up several RaftReqs and disconnect in
-    # time.
-    # Note -- for compact to succeed we need at least one key.
-    r1.client.set('somekey', 'someval')
-
-    c2.send_command('RAFT.DEBUG', 'COMPACT', '2')
-    time.sleep(0.5)
-
-    # While Raft thread is busy, pipeline a first non-MULTI request
-    c1.send_command('SET', 'test-key', '1')
-
-    # Then pipeline a MULTI/EXEC which we expect to fail, because it
-    # cannot determine CAS safety.  We also want to be sure no other
-    # commands that follow get executed.
-    c1.send_command('MULTI')
-    c1.send_command('SET', 'test-key', '2')
-    c1.send_command('EXEC')
-    c1.send_command('SET', 'test-key', '3')
-    c1.disconnect()
-
-    # Wait for RAFT.DEBUG COMPACT
-    assert c2.read_response() == b'OK'
-
-    # Make sure SET succeeded and EXEC didn't.
-    assert r1.client.get('test-key') == b'1'
+    assert n2.info()['raft_current_index'] == 7
 
 
 def test_multi_mixed_ro_rw(cluster_factory):
@@ -220,3 +143,100 @@ def test_multi_with_unsupported_commands(cluster_factory):
     c1.send_command('EXEC')
     with raises(ExecAbortError):
         c1.read_response()
+
+
+def test_multi_with_maxmemory(cluster):
+    """
+    MULTI/EXEC should fail when used memory is over the 'maxmemory' config.
+    """
+    cluster.create(3)
+
+    val = '1' * 2000
+
+    node = cluster.leader_node()
+    node.execute('set', 'key1', val)
+    node.execute('config', 'set', 'maxmemory', 100)
+
+    # Test MULTI - COMMAND - EXEC
+    assert node.execute('MULTI') == b'OK'
+    with raises(ResponseError, match='OOM command not allowed'):
+        node.execute('GET', 'key1')
+    with raises(ResponseError, match='Transaction discarded'):
+        node.execute('EXEC')
+
+    # Test MULTI - COMMAND - DISCARD
+    assert node.execute('MULTI') == b'OK'
+    with raises(ResponseError, match='OOM command not allowed'):
+        node.execute('GET', 'key1')
+    assert node.execute('DISCARD') == b'OK'
+
+    # Clear OOM
+    node.execute('config', 'set', 'maxmemory', 100000000)
+    assert node.execute('MULTI') == b'OK'
+    assert node.execute('GET', 'key1') == b'QUEUED'
+    assert node.execute('EXEC') == [val.encode()]
+
+
+def test_multi_with_acl(cluster):
+    """
+    MULTI/EXEC should fail when used a command is ACL denied
+    """
+
+    cluster.create(3)
+    node = cluster.leader_node()
+    node.execute('set', 'key1', 1)
+    node.execute('acl', 'setuser', 'default', 'resetkeys', '(+set', '~key*)',
+                 '(+get', '~key*)')
+
+    conn = RawConnection(cluster.node(1).client)
+
+    assert conn.execute('multi') == b'OK'
+    assert conn.execute('get', 'key1') == b'QUEUED'
+    assert conn.execute('set', 'key1', 2) == b'QUEUED'
+    assert conn.execute('exec') == [b'1', b'OK']
+
+    assert conn.execute('get', 'key1') == b'2'
+
+    assert conn.execute('multi') == b'OK'
+    assert conn.execute('set', 'key1', 3) == b'QUEUED'
+
+    with raises(ResponseError, match='No permissions to access a key'):
+        conn.execute('set', 'abc', 1)
+
+    assert conn.execute('set', 'key2', 1) == b'QUEUED'
+
+    msg = 'Transaction discarded because of previous errors.'
+    with raises(ResponseError, match=msg):
+        conn.execute('exec')
+
+    assert conn.execute('multi') == b'OK'
+    assert conn.execute('eval', """
+        redis.call('set','abc', 3);
+        return 1234;
+        """, 0) == b'QUEUED'
+    ret = conn.execute('exec')
+
+    assert isinstance(ret, list)
+    assert len(ret) == 1
+    assert isinstance(ret[0], ResponseError)
+
+    msg = str(ret[0])
+    assert 'ACL failure in script: No permissions to access a key' in msg
+
+
+def test_watch_within_multi(cluster):
+    """
+    MULTI/EXEC doesn't allow WATCH within multi, but EXEC still works
+    """
+    cluster.create(3)
+    node = cluster.leader_node()
+    node.execute('set', 'key1', 1)
+
+    conn = RawConnection(cluster.node(1).client)
+
+    assert conn.execute('multi') == b'OK'
+    assert conn.execute('get', 'key1') == b'QUEUED'
+    with raises(ResponseError, match='WATCH inside MULTI is not allowed'):
+        conn.execute('watch', 'x')
+    assert conn.execute('get', 'key1') == b'QUEUED'
+    assert conn.execute('exec') == [b'1', b'1']

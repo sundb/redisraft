@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Copyright Redis Ltd. 2020 - present
+# Licensed under your choice of the Redis Source Available License 2.0 (RSALv2) or
+# the Server Side Public License v1 (SSPLv1).
+
 usage() {
     echo "usage: redisraft_cluster.sh [--redis <executable>] [--raftmodule <module>]"
     echo "          [--modulearg <arg>] [--nodes <count>] [--port <base-port>] [redis arguments]"
@@ -71,10 +76,10 @@ for n in $(seq ${nodes}); do
     raftlog=redisraft${n}.db
     rm -f ${raftlog} ${raftlog}.idx
     ${redis} --loadmodule ${raftmodule} \
-        id ${n} \
-        addr 127.0.0.1:${p} \
-        raft-log-filename redisraft${n}.db \
-        follower-proxy yes \
+        --raft.id ${n} \
+        --raft.addr 127.0.0.1:${p} \
+        --raft.log-filename redisraft${n}.db \
+        --raft.follower-proxy yes \
         ${module_args[@]} \
         --logfile redis${n}.log \
         --port ${p} \

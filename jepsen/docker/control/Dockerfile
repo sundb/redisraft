@@ -1,11 +1,11 @@
-FROM debian:stretch
+FROM debian:buster
 
 #
 # Jepsen dependencies
 #
 RUN apt-get -y -q update && \
     apt-get install -qqy \
-        openjdk-8-jre \
+        openjdk-11-jdk \
         libjna-java \
         git \
         gnuplot \
@@ -19,8 +19,8 @@ RUN wget https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
     chmod +x /usr/bin/lein && \
     lein self-install
 
-ARG JEPSEN_REPO=https://github.com/jepsen-io/redis
-RUN git clone $JEPSEN_REPO /jepsen && \
+ARG JEPSEN_REPO=redislabs/jepsen-redisraft
+RUN git clone https://github.com/${JEPSEN_REPO} /jepsen && \
     cd /jepsen && \
     lein install
 

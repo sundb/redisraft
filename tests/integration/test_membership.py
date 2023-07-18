@@ -1,16 +1,14 @@
 """
-This file is part of RedisRaft.
-
-Copyright (c) 2020-2021 Redis Ltd.
-
-RedisRaft is licensed under the Redis Source Available License (RSAL).
+Copyright Redis Ltd. 2020 - present
+Licensed under your choice of the Redis Source Available License 2.0 (RSALv2)
+or the Server Side Public License v1 (SSPLv1).
 """
+
 import logging
 import time
 from threading import Thread
 import pytest
 from pytest import raises
-from .sandbox import RedisRaftTimeout
 from redis import ResponseError, RedisError
 
 logger = logging.getLogger("integration")
@@ -50,7 +48,8 @@ def test_leader_removal_allowed(cluster):
 
     cluster.create(3)
     assert cluster.leader == 1
-    cluster.node(1).client.execute_command('RAFT.NODE', 'REMOVE', '1')
+    cluster.remove_node(1)
+    cluster.node(2).wait_for_num_nodes(2)
 
 
 def test_single_voting_change_enforced(cluster):
@@ -70,14 +69,22 @@ def test_single_voting_change_enforced(cluster):
     # cluster while in progress.
     def remove_node_blocked():
         cluster.node(1).client.execute_command('RAFT.NODE', 'REMOVE', '5')
-    Thread(target=remove_node_blocked, daemon=True).start()
+
+    t = Thread(target=remove_node_blocked)
+    t.start()
 
     time.sleep(0.2)
 
-    with raises(ResponseError, match='a voting change is already in progress'):
+    with raises(ResponseError, match='one voting change only'):
         cluster.node(1).client.execute_command('RAFT.NODE', 'REMOVE', '4')
 
-    assert cluster.node(1).raft_info()['num_nodes'] == 5
+    assert cluster.node(1).info()['raft_num_nodes'] == 5
+
+    # Starting nodes again, so, blocked thread can join gracefully
+    cluster.node(2).start()
+    cluster.node(3).start()
+    cluster.node(4).start()
+    t.join()
 
 
 def test_removed_node_remains_dead(cluster):
@@ -127,9 +134,17 @@ def test_full_cluster_remove(cluster):
         leader.client.execute_command('RAFT.NODE', 'REMOVE', str(node_id))
         expected_nodes -= 1
         leader.wait_for_num_nodes(expected_nodes)
+        leader.wait_for_log_applied()
 
     # remove the leader node finally
-    leader.client.execute_command('RAFT.NODE', 'REMOVE', leader.id)
+    try:
+        leader.client.execute_command('RAFT.NODE', 'REMOVE', leader.id)
+    except Exception as e:
+        logger.info('RAFT.NODE REMOVE throws ' + str(e))
+        pass
+
+    # wait some time for the last node
+    time.sleep(3)
 
     # make sure other nodes are down
     for node_id in (1, 2, 3, 4, 5):
@@ -141,7 +156,8 @@ def test_full_cluster_remove(cluster):
         cluster.node(node_id).start()
 
     for node_id in (1, 2, 3, 4, 5):
-        assert cluster.node(node_id).raft_info()['state'] == 'uninitialized'
+        state = cluster.node(node_id).info()['raft_state']
+        assert state == 'uninitialized'
 
 
 @pytest.mark.parametrize("use_snapshot", [False, True])
@@ -152,14 +168,16 @@ def test_remove_and_rejoin_node_with_same_id_fails(cluster, use_snapshot):
     if use_snapshot:
         n = cluster.node(1)
         assert n.client.execute_command('RAFT.DEBUG', 'COMPACT') == b'OK'
-        assert n.raft_info()['log_entries'] == 0
+        assert n.info()['raft_log_entries'] == 0
 
         logger.info("Restarting node from snapshot")
         n.restart()
 
     for node in cluster.nodes.values():
-        used_node_ids = node.client.execute_command('RAFT.DEBUG', 'USED_NODE_IDS')
-        assert set(used_node_ids) == set(node_ids), "Wrong used_node_ids for node {}".format(node.id)
+        used_node_ids = node.client.execute_command('RAFT.DEBUG',
+                                                    'USED_NODE_IDS')
+        assert set(used_node_ids) == set(node_ids), \
+            "Wrong used_node_ids for node {}".format(node.id)
 
     if use_snapshot:
         cluster.wait_for_unanimity()
@@ -173,13 +191,11 @@ def test_remove_and_rejoin_node_with_same_id_fails(cluster, use_snapshot):
     cluster.node(cluster.leader).wait_for_num_nodes(2)
 
     logger.info("Re-add node")
-    with raises(ResponseError, match='failed to join'):
-        new_node = cluster.add_node(port=port, node_id=node_id, single_run=True)
+    with raises(ResponseError, match='failed to connect to cluster for join'):
+        cluster.add_node(port=port, node_id=node_id, single_run=True)
 
 
 def test_node_history_with_same_address(cluster):
-    ""
-    ""
     cluster.create(5)
     cluster.execute("INCR", "step-counter")
 
@@ -195,11 +211,11 @@ def test_node_history_with_same_address(cluster):
     for _ in range(5):
         for port in ports:
             n = cluster.add_node(port=port)
-            cluster.leader_node().wait_for_num_nodes(2)
+            cluster.leader_node().wait_for_num_voting_nodes(2)
             cluster.leader_node().wait_for_log_committed()
             cluster.leader_node().wait_for_log_applied()
             cluster.remove_node(n.id)
-            cluster.leader_node().wait_for_num_nodes(1)
+            cluster.leader_node().wait_for_num_voting_nodes(1)
             cluster.leader_node().wait_for_log_applied()
 
     # Add enough data in the log to satisfy timing
@@ -225,13 +241,25 @@ def test_node_history_with_same_address(cluster):
 def test_update_self_voting_state_from_snapshot(cluster):
     cluster.create(3)
 
-    assert cluster.node(1).client.execute_command('RAFT.DEBUG', 'NODECFG', '2', '-voting') == b'OK'
-    assert cluster.node(2).raft_info()['is_voting'] == 'yes'
-    assert cluster.node(1).client.execute_command('RAFT.DEBUG', 'COMPACT') == b'OK'
+    assert cluster.node(2).info()['raft_is_voting'] == 'yes'
+    cluster.node(2).kill()
 
-    cluster.node(1).client.execute_command('RAFT.DEBUG', 'SENDSNAPSHOT', '2')
-    cluster.node(2).wait_for_info_param('snapshots_loaded', 1)
-    assert cluster.node(2).raft_info()['is_voting'] == 'no'
+    # Set node-2 non-voting and take a snapshot
+    assert cluster.node(1).client.execute_command('RAFT.DEBUG', 'NODECFG',
+                                                  '2', '-voting') == b'OK'
+
+    # Submit an entry and include that in the snapshot. When node-2 wakes up,
+    # as it doesn't have an entry at this index, leader will send the snapshot
+    cluster.execute('set', 'x', '1')
+    assert cluster.node(1).client.execute_command('RAFT.DEBUG',
+                                                  'COMPACT') == b'OK'
+
+    # Leader will send snapshot to node-2 after wake up
+    cluster.node(2).start()
+    cluster.node(2).wait_for_info_param('raft_snapshots_received', 1)
+
+    # Validate node-2 updates its voting status from the snapshot
+    assert cluster.node(2).info()['raft_is_voting'] == 'no'
 
 
 def test_join_while_cluster_is_down(cluster):
@@ -242,22 +270,22 @@ def test_join_while_cluster_is_down(cluster):
     time.sleep(3)
 
     # Confirm nodes cannot be added
-    with raises(ResponseError, match='failed to join'):
+    with raises(ResponseError, match='failed to connect to cluster for join'):
         cluster.add_node(raft_args={'join-timeout': 1}, single_run=True,
                          join_addr_list=[cluster.node(3).address])
 
-    # Initiate process again with a longer timeout, and release the
-    # cluster while in progress.
-    def resume_nodes():
-        time.sleep(1)
-        cluster.node(1).resume()
-        cluster.node(2).resume()
 
-    # Join again, while failing resume nodes and recover cluster. This
-    # should succeed and not raise an exception as above.
-    Thread(target=resume_nodes, daemon=True).start()
-    cluster.add_node(raft_args={'join-timeout': 10}, single_run=True,
-                            join_addr_list=[cluster.node(3).address])
+def test_join_wrong_cluster(cluster):
+    cluster.create(3)
+
+    # Confirm nodes fails fast with bad server address
+    with raises(ResponseError, match='failed to connect to cluster for join'):
+        cluster.add_node(raft_args={'join-timeout': 1}, single_run=True,
+                         join_addr_list=["bad-server:1234"])
+
+    # Config node can be added after failure
+    cluster.add_node(raft_args={'join-timeout': 1}, single_run=True,
+                     join_addr_list=[cluster.node(3).address])
 
 
 def test_transfer_not_leader(cluster):
@@ -275,25 +303,38 @@ def test_transfer_invalid(cluster):
 
 
 def test_transfer_succeed(cluster):
-    cluster.create(3);
+    cluster.create(3, raft_args={'election-timeout': '3000'})
 
     cluster.leader_node().transfer_leader(2)
 
 
+def test_transfer_to_any_other(cluster):
+    cluster.create(2, raft_args={'election-timeout': '3000'})
+    cluster.leader_node().transfer_leader()
+
+
 def test_transfer_timeout(cluster):
-    cluster.create(3);
+    cluster.create(3, raft_args={'election-timeout': '3000'})
     cluster.node(2).pause()
     with raises(ResponseError, match='transfer timed out'):
         cluster.leader_node().transfer_leader(2)
 
 
 def test_transfer_unexpected(cluster):
-    cluster.create(3)
+    cluster.create(3, raft_args={'election-timeout': '10000'})
     cluster.node(2).pause()
 
     def timeout():
-        time.sleep(0.1)
+        time.sleep(3)
         cluster.node(3).timeout_now()
+
     Thread(target=timeout, daemon=True).start()
     with raises(ResponseError, match="different node elected leader"):
         cluster.leader_node().transfer_leader(2)
+
+
+def test_nodeshutdown_wrong_id(cluster):
+    cluster.create(1, raft_args={'election-timeout': '10000'})
+
+    with raises(ResponseError, match='invalid node id'):
+        cluster.node(1).client.execute_command('RAFT.NODESHUTDOWN', 51423122)

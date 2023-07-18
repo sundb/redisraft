@@ -1,0 +1,4 @@
+smove
+ro
+stdio
+edn
